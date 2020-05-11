@@ -1,0 +1,8 @@
+[{
+    "section1": [{
+        "entry1": "value1",
+        "section2": [{
+            "entry2": "value2"
+        }]
+    }]
+}]

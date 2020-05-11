@@ -1,0 +1,561 @@
+#!/usr/bin/env tclsh
+
+# TODO:
+# int64 format?
+# uint16 use W?
+# eof file pos?
+# trunc bytes option
+# section/endsection without body?
+# utf16
+# str
+# cstr
+# uuid
+# macdate
+# fatdate
+# fattime
+# unixtime32
+# unixtime64
+# uint8_bits
+# uint16_bits
+# uint32_bits
+# uint64_bits
+# requires for probe?
+# zlib_uncompress
+# print position maybe hexdump on template failure?
+# switch exact etc
+# list index path? 0/1/4/4
+# to_text bytes escape hexdump part?
+# DONE test template? compare json?
+# want to get errro and partical sectoions hmm
+
+# package require profiler
+# ::profiler::init
+
+proc eval_template {data body} {
+    namespace eval Template {
+        variable data
+        variable data_len
+        variable offset 0
+        variable sections [list]
+        variable sectionvalue ""
+        variable template_interp [interp create -safe]
+        variable int16_format s
+        variable int32_format i
+        variable float_format r
+        variable double_format q
+        variable seen_error 0
+
+        proc run {indata body} {
+            set Template::data $indata
+            set Template::data_len [string length $indata]
+            catch {interp eval $Template::template_interp $body}
+            return $Template::sections
+        }
+
+        proc _read {size} {
+            variable data
+            variable data_len
+            variable offset
+
+            if {$size < 0} {
+                error "negative read size $size at $offset file length $data_len"
+            }
+
+            set newoffset [expr $offset+$size]
+            if {$newoffset > $data_len} {
+                error "reading [expr abs($newoffset-$data_len)] byte beyond end at $offset read size $size file length $data_len"
+            }
+
+            set s [string range $data $offset [expr $newoffset-1]]
+            set offset $newoffset
+
+            return $s
+        }
+
+        proc _entry {type label body} {
+            variable offset
+            set start $offset
+            set value [uplevel 1 $body]
+            if {$label != ""} {
+                lappend Template::sections [list $type $start [expr $offset-1] $label $value]
+            }
+            return $value
+        }
+
+        proc _int_entry {type body args} {
+            variable offset
+
+            set hex 0
+            if {[lindex $args 0] == "-hex"} {
+                set hex 1
+                set args [lreplace $args 0 0]
+            }
+            lassign $args label
+
+            set start $offset
+            set value [uplevel 1 $body]
+            if {$hex} {
+                set value [format %x $value]
+            }
+            if {$label != ""} {
+                lappend Template::sections [list $type $start [expr $offset-1] $label $value]
+            }
+
+            return $value
+        }
+
+        proc _hexstr {s} {
+            set h ""
+            for {set i 0} {$i < [string length $s]} {incr i} {
+                append h [format %.2x [scan [string index $s $i] %c]]
+            }
+            list $h
+        }
+
+        $template_interp alias puts Template::puts
+        proc puts args {
+            ::puts {*}$args
+        }
+
+        $template_interp alias encoding Template::encoding
+        proc encoding args {
+            # encoding not safe, try allow what is safe
+            lassign $args arg
+            switch -exact -- $arg {
+                convertfrom -
+                convertto -
+                names {
+                    return [::encoding {*}$args]
+                }
+            }
+            error "not safe"
+        }
+
+        $template_interp alias requires Template::requires
+        proc requires {offset pattern} {
+            # TODO:
+        }
+
+        $template_interp alias end Template::end
+        proc end {} {
+            return [expr $Template::offset >= $Template::data_len]
+        }
+
+        $template_interp alias len Template::len
+        proc len {} {
+            return $Template::data_len
+        }
+
+        $template_interp alias pos Template::pos
+        proc pos {} {
+            variable offset
+            return $offset
+        }
+
+        $template_interp alias move Template::move
+        proc move {delta} {
+            variable offset
+            variable data_len
+            set newoffset [expr $offset+$delta]
+            if {$newoffset > $data_len} {
+                error "move [expr abs($newoffset-$data_len)] byte beyond end at $offset delta $delta file length $data_len"
+            }
+            set offset $newoffset
+            return $offset
+        }
+
+        $template_interp alias goto Template::goto
+        proc goto {pos} {
+            variable offset
+            variable data_len
+            if {$pos > $data_len} {
+                error "goto [expr abs($pos-$data_len)] byte beyond end at $offset delta $delta file length $data_len"
+            }
+            set offset $pos
+            return $pos
+        }
+
+        $template_interp alias little_endian Template::little_endian
+        proc little_endian {{label ""}} {
+            variable int16_format
+            variable int32_format
+            variable float_format
+            variable double_format
+            set int16_format s
+            set int32_format i
+            set float_format r
+            set double_format q
+        }
+
+        $template_interp alias big_endian Template::big_endian
+        proc big_endian {{label ""}} {
+            variable int16_format
+            variable int32_format
+            variable float_format
+            variable double_format
+            set int16_format S
+            set int32_format I
+            set float_format R
+            set double_format Q
+        }
+
+        $template_interp alias entry Template::entry
+        proc entry {label value {size ""} {pos ""}} {
+            variable sections
+            # TODO: relative
+            variable offset
+            if {$pos == ""} {
+                set pos $offset
+            }
+            if {$size != "" && $size <= 0} {
+                error "zero or negative size $size"
+            }
+            if {$size == ""} {
+                set size 0
+            }
+            lappend sections [list entry $pos [expr $pos+$size-1] $label $value]
+        }
+
+        $template_interp alias section Template::section
+        proc section {label body} {
+            variable sections
+            variable sectionvalue
+            variable i
+            variable offset
+            set saved_sections $sections
+            set saved_sectionvalue $sectionvalue
+            set saved_offset $offset
+            set sections [list]
+            set sectionvalue ""
+            set errresult [catch {$Template::template_interp eval $body} result]
+            lappend saved_sections [list section $saved_offset $offset $label $sectionvalue $sections]
+            set sections $saved_sections
+            set sectionvalue $saved_sectionvalue
+
+            if {$errresult} {
+                if {!$Template::seen_error} {
+                    lappend sections [list error $offset $offset "Template error" [list $result $::errorCode $::errorInfo]]
+                    set Template::seen_error 1
+                }
+
+                return -code $errresult \
+                    -errorcode $::errorCode \
+                    -errorinfo $::errorInfo \
+                    $result
+            }
+        }
+
+        $template_interp alias sectionvalue Template::sectionvalue
+        proc sectionvalue {value} {
+            variable sectionvalue
+            set sectionvalue $value
+        }
+
+        $template_interp alias ascii Template::ascii
+        proc ascii {size {label ""}} {
+            return [_entry ascii $label {
+                _read $size
+            }]
+        }
+
+        $template_interp alias bytes Template::bytes
+        proc bytes {size {label ""}} {
+            return [_entry bytes $label {
+                _read $size
+            }]
+        }
+
+        $template_interp alias hex Template::hex
+        proc hex {size {label ""}} {
+            return [_entry hex $label {
+                _hexstr [_read $size]
+            }]
+        }
+
+        $template_interp alias int8 Template::int8
+        proc int8 args {
+            return [_int_entry int8 {
+                binary scan [_read 1] c n
+                expr $n
+            } {*}$args]
+        }
+
+        $template_interp alias int16 Template::int16
+        proc int16 args {
+            return [_int_entry int16 {
+                binary scan [_read 2] $Template::int16_format n
+                expr $n
+            } {*}$args]
+        }
+
+        $template_interp alias int24 Template::int24
+        proc int24 args {
+            return [_int_entry int24 {
+                binary scan [_read 3] "${Template::int16_format}c" a b
+                if {$Template::int16_format == "s"} {
+                    set n [expr ($b&0xff)<<16 | ($a&0xffff)]
+                } else {
+                    set n [expr ($a&0xffff)<<8 | ($b&0xff)]
+                }
+                # two complement
+                if {$n & 0x800000} {
+                    set n [expr -((~$n & 0x7fffff)+1)]
+                }
+                list $n
+            } {*}$args]
+        }
+
+        $template_interp alias int32 Template::int32
+        proc int32 args {
+            return [_int_entry int32 {
+                binary scan [_read 4] $Template::int32_format n
+                expr $n
+            } {*}$args]
+        }
+
+        $template_interp alias int64 Template::int64
+        proc int64 args {
+            return [_int_entry int64 {
+                binary scan [_read 8] $Template::int32_format$Template::int32_format a b
+                # if little endian swap
+                if {$Template::int32_format == "i"} {
+                    lassign [list $a $b] b a
+                }
+                expr $a<<32 | $b
+            } {*}$args]
+        }
+
+        $template_interp alias uint8 Template::uint8
+        proc uint8 args {
+            return [_int_entry uint8 {
+                binary scan [_read 1] c n
+                expr $n & 0xff
+            } {*}$args]
+        }
+
+        $template_interp alias uint16 Template::uint16
+        proc uint16 args {
+            return [_int_entry uint16 {
+                set c [binary scan [_read 2] $Template::int16_format n]
+                expr $n & 0xffff
+            } {*}$args]
+        }
+
+        $template_interp alias uint24 Template::uint24
+        proc uint24 args {
+            return [_int_entry uint24 {
+                binary scan [_read 3] "${Template::int16_format}c" a b
+                if {$Template::int16_format == "s"} {
+                    expr ($b&0xff)<<16 | ($a&0xffff)
+                } else {
+                    expr ($a&0xffff)<<8 | ($b&0xff)
+                }
+            } {*}$args ]
+        }
+
+        $template_interp alias uint32 Template::uint32
+        proc uint32 args {
+            return [_int_entry uint32 {
+                binary scan [_read 4] $Template::int32_format n
+                expr $n & 0xffffffff
+            } {*}$args]
+        }
+
+        $template_interp alias uint64 Template::uint64
+        proc uint64 args {
+            return [_int_entry uint64 {
+                binary scan [_read 8] $Template::int32_format$Template::int32_format a b
+                # if little endian swap
+                if {$Template::int32_format == "i"} {
+                    lassign [list $a $b] b a
+                }
+                expr ($a & 0xffffffff)<<32 | ($b & 0xffffffff)
+            } {*}$args]
+        }
+
+        $template_interp alias float Template::float
+        proc float {{label ""}} {
+            return [_entry float $label {
+                binary scan [_read 4] $Template::float_format n
+                list $n
+            }]
+        }
+
+        $template_interp alias double Template::double
+        proc double {{label ""}} {
+            return [_entry double $label {
+                binary scan [_read 8] $Template::double_format n
+                list $n
+            }]
+        }
+    }
+
+    return [Template::run $data $body]
+}
+
+proc to_text {sections verbose raw_bytes {indent 0}} {
+    foreach s $sections {
+        lassign $s type start stop label value child_sections
+        if {$label == ""} {
+            continue
+        }
+
+        if {$type == "bytes"} {
+            set s [format "(%d bytes)" [string length $value]]
+            set value $s
+        }
+
+        puts [format "%s%s (%s %d-%d): %s" [string repeat "     " $indent] $label $type $start $stop $value]
+        if {$type == "section"} {
+            to_text $child_sections $verbose $raw_bytes [expr $indent+1]
+        }
+    }
+}
+
+proc json_escape {s} {
+    set e [list]
+    for {set i 0} {$i < [string length $s]} {incr i} {
+        set c [string index $s $i]
+        if {$c == "\n"} {
+            append e "\\n"
+        } elseif {$c == "\\" || $c == "\""} {
+            append e "\\$c"
+        } elseif {[string is ascii $c] && ![string is control $c]} {
+            append e $c
+        } else {
+            scan $c %c n
+            append e [format "\\u00%.2x" $n]
+        }
+    }
+    return $e
+}
+
+proc to_json {sections verbose raw_bytes {indent 0}} {
+    set is [string repeat "    " $indent]
+    set last [expr [llength $sections]-1]
+
+    puts "\[{"
+
+    for {set i 0} {$i <= $last} {incr i} {
+        lassign [lindex $sections $i] type start stop label value child_sections
+        if {$label == ""} {
+            continue
+        }
+        set delim ","
+        if {$i == $last} {
+            set delim ""
+        }
+
+        if {$verbose} {
+            puts [format {%s    "%s": [%d, %d]} $is [json_escape "${label}_range"] $start $stop]]
+        }
+
+        switch -exact -- $type {
+            int8 -
+            int16 -
+            int24 -
+            int32 -
+            int64 -
+            uint8 -
+            uint16 -
+            uint24 -
+            uint32 -
+            uint64 -
+            double -
+            float {
+                puts [format {%s    "%s": %s%s} $is [json_escape $label] $value $delim]
+            }
+            bytes {
+                if {$raw_bytes} {
+                    puts [format {%s    "%s": "%s"%s} $is [json_escape $label] $value $delim]
+                } else {
+                    puts [format {%s    "%s": "%s"%s} $is [json_escape $label] [format "/* %d bytes */" [string length $value]] $delim]
+                }
+            }
+            section {
+                if {$verbose} {
+                    puts [format {%s    "%s": %s} $is [json_escape "${label}_value"] $value]]
+                }
+                puts -nonewline [format {%s    "%s": } $is [json_escape $label]]
+                to_json $child_sections $verbose $raw_bytes [expr $indent+1]
+                puts $delim
+            }
+
+            default {
+                puts [format {%s    "%s": "%s"%s} $is [json_escape $label] [json_escape $value] $delim]
+            }
+        }
+    }
+
+    puts -nonewline [format {%s%s} $is "}\]"]
+    if {$indent == 0} {
+        puts {}
+    }
+}
+
+proc help {} {
+    global argv0
+    puts [string trim "
+Usage: $argv0 \[OPTIONS\] \[--\] TEMPLATE FILE
+  -f, --format FORMAT  Output format (text, json)
+  -b, --bytes          Include raw bytes in json
+  -v, --verbose        Include _range, _size, _section_value
+"]
+}
+
+set flag_raw_bytes 0
+set flag_verbose 0
+set flag_format to_text
+
+foreach arg $argv {
+    switch -glob -- $arg {
+        -f - --format {
+            set format [lindex $argv 1]
+            switch -exact -- $format {
+                json {set flag_format to_json}
+                text {set flag_format to_text}
+                default {
+                    puts "Unknown format: $format"
+                    exit 1
+                }
+            }
+            set argv [lreplace $argv 0 0]
+        }
+        -b - -bytes {set flag_raw_bytes 1}
+        -v - --verbose {set flag_verbose 1}
+        -h - --help {
+            help
+            exit 0
+        }
+        -- {break}
+        -* {
+            puts "Unknown argument: $arg"
+            exit 1
+        }
+        default {
+            break
+        }
+    }
+    set argv [lreplace $argv 0 0]
+}
+lassign $argv template_filename data_filename
+
+if {$template_filename == "" || $data_filename == ""} {
+    help
+    exit 1
+}
+
+set templatef [open $template_filename r]
+fconfigure $templatef -translation binary
+set template [read $templatef]
+
+set dataf [open $data_filename r]
+fconfigure $dataf -translation binary
+set data [read $dataf]
+
+set s [eval_template $data $template]
+
+fconfigure stdout -translation binary
+$flag_format $s $flag_verbose $flag_raw_bytes
+
+# puts [::profiler::print]
